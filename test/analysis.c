@@ -10,18 +10,19 @@
 #include <stdio.h>
 #include <zconf.h>
 
-#ifdef __linux
+#if defined(__linux) || defined(__unix)
 	#include <sys/resource.h>
 	#include <memory.h>
 	#include <errno.h>
 #endif
 
 //Options
-#define STEPS 1000000
+#define STEPS 4098
 #define SIZE_ALLOC_MAX 4096
 #define SIZE_ALLOC_MIN 1
-#define SIZE_ALLOC_FIXED
+//#define SIZE_ALLOC_FIXED
 #define SEED 1234
+#define UNCERTAINTY_STEPS 1000
 
 /*
  * Converts timespec to double
@@ -35,19 +36,38 @@ double time_to_double(struct timespec time)
 	return ((double) time.tv_sec + (time.tv_nsec / 1000000000.0));
 }
 
-/*#ifdef __linux
-	struct rusage r_usage_start;
-	if (getrusage(RUSAGE_SELF, &r_usage_start) == -1)
+/*
+ * Calculates uncertainty of timespec function
+ *
+ * @return double time
+ */
+double uncertainty_get(void)
+{
+	double uncertainty = 0;
+	for (int i = 0; i < UNCERTAINTY_STEPS; ++i)
 	{
-		printf("ERROR: Could not record resource usage.\n");
-		printf("Linux errno: %s\n", strerror(errno));
-		exit(EXIT_FAILURE);
+		struct timespec ts_start;
+		if (timespec_get(&ts_start, TIME_UTC) == 0) {
+			printf("ERROR: Could not record resource usage.\n");
+			exit(EXIT_FAILURE);
+		}
+
+		struct timespec ts_end;
+		if (timespec_get(&ts_end, TIME_UTC) == 0) {
+			printf("ERROR: Could not record resource usage.\n");
+			exit(EXIT_FAILURE);
+		}
+
+		uncertainty += time_to_double(ts_end) - time_to_double(ts_start);
 	}
-	#endif*/
+
+	return uncertainty / UNCERTAINTY_STEPS;
+}
 
 int main(int argc, char **argv)
 {
-	double average_total = 0;
+	double time_average = 0;
+	double memory_average_extra = 0;
 	//Setup seed
 	#ifndef SEED
 	const unsigned int SEED = (const unsigned int)time(NULL);
@@ -56,10 +76,18 @@ int main(int argc, char **argv)
 	srand(SEED);
 
 	//Record resources for start
+	#if defined(__linux) || defined(__unix)
+		unsigned int memory_start = (unsigned int)sbrk(0);
+	#endif
+
 	clock_t time_start = clock();
 
 	for (int i = 0; i < STEPS; ++i)
 	{
+		#if defined(__linux) || defined(__unix)
+		unsigned int m_start = (unsigned int)sbrk(0);
+		#endif
+
 		struct timespec ts_start;
 		if (timespec_get(&ts_start, TIME_UTC) == 0)
 		{
@@ -68,7 +96,13 @@ int main(int argc, char **argv)
 		}
 
 		//Testcase core
-		volatile int * r = (int *)malloc(1024);
+		#ifdef SIZE_ALLOC_FIXED
+		unsigned int r = SIZE_ALLOC_FIXED;
+		#else
+		unsigned int r = (unsigned int)rand() % (SIZE_ALLOC_MAX - SIZE_ALLOC_MIN) + SIZE_ALLOC_MAX;
+		#endif
+
+		malloc(r);
 
 		struct timespec ts_end;
 		if (timespec_get(&ts_end, TIME_UTC) == 0)
@@ -77,27 +111,59 @@ int main(int argc, char **argv)
 			exit(EXIT_FAILURE);
 		}
 
-		average_total += time_to_double(ts_end) - time_to_double(ts_start);
+		#if defined(__linux) || defined(__unix)
+		unsigned int m_end = (unsigned int)sbrk(0);
+		#endif
+
+		time_average += time_to_double(ts_end) - time_to_double(ts_start);
+		memory_average_extra += (double)(m_end - m_start) - r;
 	}
 
 	//Record resources for end
 	clock_t time_end = clock();
 
+	#if defined(__linux) || defined(__unix)
+	unsigned int memory_end = (unsigned int)sbrk(0);
+	#endif
+
 	//Print results
-	printf("Linux Results\n+");
+	printf("Results\n+");
 	for (int i = 0; i < 46; ++i)
 		putchar('-');
 	printf("+\n");
+
+	printf("| %-25s | %16d |\n", "Steps", (int)STEPS);
+	printf("| %-25s | %16d |\n", "SEED", (int)SEED);
+	printf("| %-25s | %16d |\n", "Minimum allocation size", (int)SIZE_ALLOC_MIN);
+	printf("| %-25s | %16d |\n", "Maximum allocation size", (int)SIZE_ALLOC_MAX);
+
+	#ifdef SIZE_ALLOC_FIXED
+	printf("| %-25s | %16d |\n", "Fixed allocation size", (int)SIZE_ALLOC_FIXED);
+	#endif
 
 	//Time taken
 	printf("|");
 	for (int i = 0; i < 46; ++i)
 		putchar('-');
 	printf("|\n");
-	printf("| %-25s | %16.8lf |\n", "CPU time used", (double)(time_end - time_start) / CLOCKS_PER_SEC);
-	printf("| %-25s | %8d/1000000 |\n", "CLOCKS_PER_SEC", (int)CLOCKS_PER_SEC);
-	printf("| %-25s | %16.14lf |\n", "Average time", average_total / STEPS);
 
+	printf("| %-25s | %16e |\n", "CPU time used", (double)(time_end - time_start) / CLOCKS_PER_SEC);
+	printf("| %-25s | %8d/1000000 |\n", "CLOCKS_PER_SEC", (int)CLOCKS_PER_SEC);
+	printf("| %-25s | %16e |\n", "Average time", time_average / STEPS);
+	printf("| %-25s | %16e |\n", "Uncertainty (+-)", uncertainty_get() / STEPS);
+	printf("| %-25s | %16d |\n", "Uncertainty steps", UNCERTAINTY_STEPS);
+
+	//Memory used
+	printf("|");
+	for (int i = 0; i < 46; ++i)
+		putchar('-');
+	printf("|\n");
+
+	#if defined(__linux) || defined(__unix)
+	printf("| %-25s | %16d |\n", "Memory used (sbrk)", memory_end - memory_start);
+	#endif
+
+	printf("| %-25s | %16lf |\n", "Average extra memory used", memory_average_extra / STEPS);
 
 	putchar('+');
 	for (int i = 0; i < 46; ++i)
