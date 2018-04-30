@@ -15,11 +15,8 @@
 //#define USE_LOCK_GLOBAL
 //#define USE_LOCK_SPIN
 
-//Hash table
+//Tree table
 #define TABLE_SIZE 4096
-
-//Pot
-#define POT_SIZE 1
 
 //Defult Pagesize
 #define PAGESIZE_DEFAULT 4096
@@ -68,26 +65,37 @@
 	#endif //_WIN32
 #endif //USE_LOCK_SPIN
 
-//Pot node
-struct pot
+//Memory block
+struct block
 {
-	struct pot * prev; //Address of prev pot
-	struct pot * next; //Address of next pot
+	size_t size;
+	struct block * prev;
+	struct block * next;
 } __attribute__((packed));
 
-//Alloction segment
-struct segment
+struct node
 {
-	struct pot * pot; //Address to pot head
-	size_t size; //Number of tree nodes in segment
+	struct block * parent; //Parent node
+	struct block * a; //Child A
+	struct block * b; //Child B
+} __attribute__((packed));
+
+//Alloction tree
+struct tree
+{
+	struct block * root; //Address to root
+	struct block * last; //right most leaf
+	size_t size; //Number of nodes in tree
 } __attribute__((packed));
 
 /* ----------------- vars & macros ---------------- */
 
 //Hash table
-struct segment table[TABLE_SIZE];
+struct tree table[TABLE_SIZE];
 
 #define PAGE_FAIL NULL
+#define HEADER_SIZE (sizeof(struct block) + sizeof(struct node))
+#define BLOCK_NODE_GET(b) ((struct node *)b + sizeof(struct block))
 
 /* ------------------------------------------------- */
 
@@ -279,50 +287,115 @@ int page_free(void * addr, size_t size)
 }
 
 /*
- * @function pot_create
- * Create new pot and add it to the pot linked list
+ * @function tree_swap
+ * Swaps two tree nodes.
  *
- * @param struct pot * list or tail, NULL to create list
- * @return struct pot * new node, NULL if fail
+ * @param struct node * A, struct node * B
  */
-struct pot * pot_create(struct pot * list)
+void tree_swap(struct node * a, struct node * b)
 {
-	//Get new page
-	struct pot * pot = (struct pot *)page_get((size_t)(POT_SIZE * page_size_get()));
-	if (pot == PAGE_FAIL)
-		return NULL;
-
-	//Set pointers
-	if (list == NULL)
-		pot->prev = NULL;
-	else
-		pot->prev = list;
-
-	pot->next = NULL;
-
-	if (list == NULL)
-		list = pot;
-	else
-		list->next = pot;
-	return pot;
+	struct node temp = *a;
+	*a = *b;
+	*b = temp;
 }
 
 /*
- * @function pot_remove
- * Removes pot from pot linked list and returns memory to system.
+ * @function tree_compare
+ * Compares nodes and returns true if node a is greater
  *
- * @param struct pot * pot
+ * @param struct block * a, struct block * b
+ * @return bool
  */
-void pot_remove(struct pot * pot)
+bool tree_compare(struct block * a, struct block * b)
 {
-	if (pot == NULL)
-		return;
+	if (a->size > b->size || a->size == b->size && a > b)
+		return true;
 
-	if (pot->prev)
-		pot->prev->next = pot->next;
-
-	if (pot->next)
-		pot->next->prev = pot->prev;
-
-	page_free((void *)pot, (size_t)(POT_SIZE * page_size_get()));
+	return false;
 }
+
+/*
+ * @function tree_insert
+ * Insert free node into tree
+ *
+ * @param struct block * b, struct tree * t
+ * @return int 0 if success
+ */
+int tree_insert(struct block * b, struct tree * t)
+{
+	if (b == NULL || t == NULL)
+		return -1;
+
+	//Set children to NULL
+	struct node * n = BLOCK_NODE_GET(b);
+	n->a = NULL;
+	n->b = NULL;
+
+	//If tree is empty then insert at root
+	if (t->root == NULL)
+	{
+		t->root = b;
+		t->last = b;
+		t->size++;
+		return 0;
+	}
+
+	//Find insert point
+	struct block * i = t->last;
+	while(BLOCK_NODE_GET(i)->parent != NULL && i == BLOCK_NODE_GET(BLOCK_NODE_GET(i)->parent)->b)
+		i = BLOCK_NODE_GET(i)->parent;
+
+	if (BLOCK_NODE_GET(i)->parent != NULL)
+	{
+		if (BLOCK_NODE_GET(BLOCK_NODE_GET(i)->parent)->b != NULL)
+		{
+			i = BLOCK_NODE_GET(BLOCK_NODE_GET(i)->parent)->b;
+			while (BLOCK_NODE_GET(i)->b != NULL)
+				i = BLOCK_NODE_GET(i)->b;
+		}
+		else
+			i = BLOCK_NODE_GET(i)->parent;
+	}
+	else
+		while (BLOCK_NODE_GET(i)->a != NULL)
+			i = BLOCK_NODE_GET(i)->a;
+
+	//Insert node
+	if (BLOCK_NODE_GET(i)->a == NULL)
+		BLOCK_NODE_GET(i)->a = b;
+	else
+		BLOCK_NODE_GET(i)->b = b;
+
+	BLOCK_NODE_GET(b)->parent = i;
+	BLOCK_NODE_GET(b)->a = NULL;
+	BLOCK_NODE_GET(b)->b = NULL;
+	t->last = b;
+	t->size++;
+
+	//Fix heap
+	i = b;
+	while (BLOCK_NODE_GET(i)->parent != NULL && tree_compare(BLOCK_NODE_GET(i)->parent, i))
+	{
+		//Swap with parent and move up
+		tree_swap(BLOCK_NODE_GET(i), BLOCK_NODE_GET(BLOCK_NODE_GET(i)->parent));
+		i = BLOCK_NODE_GET(i)->parent;
+	}
+
+	return 0;
+}
+
+//TODO: add remove node function
+//TODO: add search node function
+
+#ifdef DEBUG
+int main()
+{
+
+	char array[255];
+	struct block * b = (struct block *)array;
+	tree_insert(b, &table[0]);
+	struct tree * t = &table[0];
+	printf("t: %p\nSize: %zu\nRoot: %p\nLast: %p\n", t, t->size, t->root, t->last);
+	return 0;
+}
+#endif
