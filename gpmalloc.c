@@ -308,12 +308,16 @@ void tree_swap(struct node * a, struct node * b)
  */
 bool tree_compare(struct block * a, struct block * b)
 {
+	if (a == NULL || b == NULL)
+		return false;
+
 	if (a->size > b->size || a->size == b->size && a > b)
 		return true;
 
 	return false;
 }
 
+//TODO: clean up tree insert function
 /*
  * @function tree_insert
  * Insert free node into tree
@@ -330,6 +334,7 @@ int tree_insert(struct block * b, struct tree * t)
 	struct node * n = BLOCK_NODE_GET(b);
 	n->a = NULL;
 	n->b = NULL;
+	n->parent = NULL;
 
 	//If tree is empty then insert at root
 	if (t->root == NULL)
@@ -384,18 +389,170 @@ int tree_insert(struct block * b, struct tree * t)
 	return 0;
 }
 
-//TODO: add remove node function
+//TODO: cleanup remove node function
+/*
+ * @function tree_remove
+ * Removes free node from tree
+ *
+ * @param struct block * b, struct tree * t
+ * @return int 0 if success
+ */
+int tree_remove(struct block * b, struct tree * t)
+{
+	if (b == NULL || t == NULL)
+		return -1;
+
+	//Remove root if it has no children
+	if (BLOCK_NODE_GET(b)->parent == NULL && BLOCK_NODE_GET(b)->a == NULL && BLOCK_NODE_GET(b)->b == NULL)
+	{
+		t->root = NULL;
+		t->last = NULL;
+		t->size--;
+		return 0;
+	}
+
+	//Find last node
+	struct block * i = t->last;
+	while(BLOCK_NODE_GET(i)->parent != NULL && i == BLOCK_NODE_GET(BLOCK_NODE_GET(i)->parent)->a)
+		i = BLOCK_NODE_GET(i)->parent;
+
+	if (BLOCK_NODE_GET(i)->parent != NULL)
+		i = BLOCK_NODE_GET(BLOCK_NODE_GET(i)->parent)->a;
+
+	while (BLOCK_NODE_GET(i)->b != NULL)
+		i = BLOCK_NODE_GET(i)->b;
+
+	//Remove last node
+	if (BLOCK_NODE_GET(BLOCK_NODE_GET(t->last)->parent)->a == t->last)
+		BLOCK_NODE_GET(BLOCK_NODE_GET(t->last)->parent)->a = NULL;
+	else
+		BLOCK_NODE_GET(BLOCK_NODE_GET(t->last)->parent)->b = NULL;
+
+	if (b == t->last)
+		t->last = i;
+	else
+	{
+		//Swap with i and delete
+		struct block * n = t->last;
+		tree_swap(BLOCK_NODE_GET(b), BLOCK_NODE_GET(n));
+
+		if (b != i)
+			t->last = i;
+
+		//Fix heap
+		while (BLOCK_NODE_GET(n)->parent != NULL && tree_compare(BLOCK_NODE_GET(n)->parent, n))
+			tree_swap(BLOCK_NODE_GET(n), BLOCK_NODE_GET(BLOCK_NODE_GET(n)->parent)); //Move up
+
+		//Move
+		if (BLOCK_NODE_GET(n)->parent != NULL && tree_compare(n, BLOCK_NODE_GET(n)->parent))
+		{
+			do
+			{
+				tree_swap(BLOCK_NODE_GET(n), BLOCK_NODE_GET(BLOCK_NODE_GET(n)->parent));
+			} while (BLOCK_NODE_GET(n)->parent != NULL && tree_compare(n, BLOCK_NODE_GET(n)->parent));
+		}
+		else
+		{
+			while (BLOCK_NODE_GET(n)->a != NULL && BLOCK_NODE_GET(n)->b != NULL)
+			{
+				if (BLOCK_NODE_GET(n)->b != NULL && tree_compare(BLOCK_NODE_GET(n)->a, BLOCK_NODE_GET(n)->b))
+					if (tree_compare(n, BLOCK_NODE_GET(n)->a)) //Left swap
+						tree_swap(BLOCK_NODE_GET(n), BLOCK_NODE_GET(BLOCK_NODE_GET(n)->a));
+					else
+						break;
+				else if (tree_compare(n, BLOCK_NODE_GET(n)->b)) //Right swap
+					tree_swap(BLOCK_NODE_GET(n), BLOCK_NODE_GET(BLOCK_NODE_GET(n)->b));
+				else
+					break;
+			}
+		}
+		/*while (BLOCK_NODE_GET(n)->a != NULL && BLOCK_NODE_GET(n)->b != NULL)
+		{
+			if (tree_compare(n, BLOCK_NODE_GET(n)->a))
+			{
+				tree_swap(BLOCK_NODE_GET(n), BLOCK_NODE_GET(BLOCK_NODE_GET(n)->a));
+				n = BLOCK_NODE_GET(n)->a;
+				continue;
+			}
+
+			if (tree_compare(n, BLOCK_NODE_GET(n)->b))
+			{
+				tree_swap(BLOCK_NODE_GET(n), BLOCK_NODE_GET(BLOCK_NODE_GET(n)->b));
+				n = BLOCK_NODE_GET(n)->b;
+				continue;
+			}
+
+			break;
+		}*/
+	}
+
+	t->size--;
+	return 0;
+}
+
+/*
+ * @function tree_search_recursive
+ * Used by tree_search function to find node of size.
+ *
+ * @param size_t s, struct block * i
+ * return struct block * b
+ */
+struct block * tree_search_recursive(size_t s, struct block * i)
+{
+	if (i != NULL && i->size < s)
+	{
+		struct block * n = NULL;
+		if ((n = tree_search_recursive(s, BLOCK_NODE_GET(i)->a)) != NULL)
+				return n;
+
+		if ((n = tree_search_recursive(s, BLOCK_NODE_GET(i)->b)) != NULL)
+				return n;
+	}
+
+	return i;
+}
+
 //TODO: add search node function
+/*
+ * @function tree_search
+ * Finds node with a size >= to specified size.
+ *
+ * @param size_t s, struct tree * t
+ * @return struct block * b
+ */
+struct block * tree_search(size_t s, struct tree * t)
+{
+	return tree_search_recursive(s, t->root);
+}
 
 #ifdef DEBUG
 int main()
 {
 
-	char array[255];
-	struct block * b = (struct block *)array;
-	tree_insert(b, &table[0]);
 	struct tree * t = &table[0];
-	printf("t: %p\nSize: %zu\nRoot: %p\nLast: %p\n", t, t->size, t->root, t->last);
+
+	char b1_a[255];
+	struct block * b1 = (struct block *)b1_a;
+	b1->size = 100;
+	tree_insert(b1, &table[0]);
+	printf("t: %p\nSize: %zu\nRoot: %p\nLast: %p\n\n", t, t->size, t->root, t->last);
+
+	char b2_a[255];
+	struct block * b2 = (struct block *)b2_a;
+	b2->size = 100;
+	tree_insert(b2, &table[0]);
+	printf("t: %p\nSize: %zu\nRoot: %p\nLast: %p\n\n", t, t->size, t->root, t->last);
+
+	char b3_a[255];
+	struct block * b3 = (struct block *)b3_a;
+	b3->size = 200;
+	tree_insert(b3, &table[0]);
+	printf("t: %p\nSize: %zu\nRoot: %p\nLast: %p\n\n", t, t->size, t->root, t->last);
+
+
+	//tree_remove(b3, &table[0]);
+	printf("Found: %p\n\n", tree_search(300, &table[0]));
+	printf("t: %p\nSize: %zu\nRoot: %p\nLast: %p\n\n", t, t->size, t->root, t->last);
 	return 0;
 }
 #endif
