@@ -65,37 +65,42 @@
 	#endif //_WIN32
 #endif //USE_LOCK_SPIN
 
-//Memory block
+//Memory block used or small free
 struct block
 {
 	size_t size;
-	struct block * prev;
-	struct block * next;
+	struct block * block_prev;
+	struct block * block_next;
 } __attribute__((packed));
 
-struct node
+//Free Memory block
+struct block_free
 {
-	struct block * parent; //Parent node
-	struct block * a; //Child A
-	struct block * b; //Child B
+	size_t size;
+	struct block * block_prev;
+	struct block * block_next;
+	struct block_free * pool_prev;
+	struct block_free * pool_next;
 } __attribute__((packed));
 
-//Alloction tree
-struct tree
+//Holds free blocks as linked list
+struct pool
 {
-	struct block * root; //Address to root
-	struct block * last; //right most leaf
-	size_t size; //Number of nodes in tree
+	struct block_free * start;
+	struct block_free * end;
+	size_t size;
+
+	#ifndef USE_LOCK_GLOBAL
+		lock_t l;
+	#endif;
 } __attribute__((packed));
 
 /* ----------------- vars & macros ---------------- */
 
 //Hash table
-struct tree table[TABLE_SIZE];
+struct pool table[TABLE_SIZE];
 
 #define PAGE_FAIL NULL
-#define HEADER_SIZE (sizeof(struct block) + sizeof(struct node))
-#define BLOCK_NODE_GET(b) ((struct node *)b + sizeof(struct block))
 
 /* ------------------------------------------------- */
 
@@ -287,272 +292,147 @@ int page_free(void * addr, size_t size)
 }
 
 /*
- * @function tree_swap
- * Swaps two tree nodes.
+ * @function pool_swap
+ * Swaps two free nodes in pool
  *
- * @param struct node * A, struct node * B
+ * @param struct block_free * a, struct block_free * b
  */
-void tree_swap(struct node * a, struct node * b)
-{
-	struct node temp = *a;
-	*a = *b;
-	*b = temp;
-}
-
-/*
- * @function tree_compare
- * Compares nodes and returns true if node a is greater
- *
- * @param struct block * a, struct block * b
- * @return bool
- */
-bool tree_compare(struct block * a, struct block * b)
+void pool_swap(struct block_free * a, struct block_free * b)
 {
 	if (a == NULL || b == NULL)
-		return false;
+		return;
 
-	if (a->size > b->size || a->size == b->size && a > b)
-		return true;
-
-	return false;
+	struct block_free * temp_p = a->pool_prev;
+	struct block_free * temp_n = a->pool_next;
+	a->pool_prev = b->pool_prev;
+	a->pool_next = b->pool_next;
+	b->pool_prev = temp_p;
+	b->pool_next = temp_n;
 }
 
-//TODO: clean up tree insert function
 /*
- * @function tree_insert
- * Insert free node into tree
+ * @function pool_sort
+ * Sorts node in pool
  *
- * @param struct block * b, struct tree * t
- * @return int 0 if success
+ * @param struct block_free * b, struct pool * p
  */
-int tree_insert(struct block * b, struct tree * t)
+void pool_sort(struct block_free * b, struct pool * p)
 {
-	if (b == NULL || t == NULL)
+	//TODO: fix pool_sort function
+	while (b->pool_next != p->end && b->pool_next->size < b->size)
+	{
+		pool_swap(b, b->pool_next);
+	}
+}
+
+/*
+ * @function pool_insert
+ * Adds free block into pool's linked list
+ *
+ * @param struct block_free * b, struct pool * p
+ * @return int 0 success
+ */
+int pool_insert(struct block_free * b, struct pool * p)
+{
+	if (b == NULL || p == NULL)
 		return -1;
 
-	//Set children to NULL
-	struct node * n = BLOCK_NODE_GET(b);
-	n->a = NULL;
-	n->b = NULL;
-	n->parent = NULL;
+	//Lock pool
+	lock_wait(&p->l);
 
-	//If tree is empty then insert at root
-	if (t->root == NULL)
+	//First node
+	if (p->start == NULL)
 	{
-		t->root = b;
-		t->last = b;
-		t->size++;
+		b->pool_prev = NULL;
+		b->pool_next = NULL;
+		p->start = b;
+		p->end = b;
+		p->size++;
 		return 0;
 	}
 
-	//Find insert point
-	struct block * i = t->last;
-	while(BLOCK_NODE_GET(i)->parent != NULL && i == BLOCK_NODE_GET(BLOCK_NODE_GET(i)->parent)->b)
-		i = BLOCK_NODE_GET(i)->parent;
-
-	if (BLOCK_NODE_GET(i)->parent != NULL)
-	{
-		if (BLOCK_NODE_GET(BLOCK_NODE_GET(i)->parent)->b != NULL)
-		{
-			i = BLOCK_NODE_GET(BLOCK_NODE_GET(i)->parent)->b;
-			while (BLOCK_NODE_GET(i)->b != NULL)
-				i = BLOCK_NODE_GET(i)->b;
-		}
-		else
-			i = BLOCK_NODE_GET(i)->parent;
-	}
-	else
-		while (BLOCK_NODE_GET(i)->a != NULL)
-			i = BLOCK_NODE_GET(i)->a;
-
-	//Insert node
-	if (BLOCK_NODE_GET(i)->a == NULL)
-		BLOCK_NODE_GET(i)->a = b;
-	else
-		BLOCK_NODE_GET(i)->b = b;
-
-	BLOCK_NODE_GET(b)->parent = i;
-	BLOCK_NODE_GET(b)->a = NULL;
-	BLOCK_NODE_GET(b)->b = NULL;
-	t->last = b;
-	t->size++;
-
-	//Fix heap
-	i = b;
-	while (BLOCK_NODE_GET(i)->parent != NULL && tree_compare(BLOCK_NODE_GET(i)->parent, i))
-	{
-		//Swap with parent and move up
-		tree_swap(BLOCK_NODE_GET(i), BLOCK_NODE_GET(BLOCK_NODE_GET(i)->parent));
-		i = BLOCK_NODE_GET(i)->parent;
-	}
-
-	return 0;
-}
-
-//TODO: cleanup remove node function
-/*
- * @function tree_remove
- * Removes free node from tree
- *
- * @param struct block * b, struct tree * t
- * @return int 0 if success
- */
-int tree_remove(struct block * b, struct tree * t)
-{
-	if (b == NULL || t == NULL)
-		return -1;
-
-	//Remove root if it has no children
-	if (BLOCK_NODE_GET(b)->parent == NULL && BLOCK_NODE_GET(b)->a == NULL && BLOCK_NODE_GET(b)->b == NULL)
-	{
-		t->root = NULL;
-		t->last = NULL;
-		t->size--;
-		return 0;
-	}
-
-	//Find last node
-	struct block * i = t->last;
-	while(BLOCK_NODE_GET(i)->parent != NULL && i == BLOCK_NODE_GET(BLOCK_NODE_GET(i)->parent)->a)
-		i = BLOCK_NODE_GET(i)->parent;
-
-	if (BLOCK_NODE_GET(i)->parent != NULL)
-		i = BLOCK_NODE_GET(BLOCK_NODE_GET(i)->parent)->a;
-
-	while (BLOCK_NODE_GET(i)->b != NULL)
-		i = BLOCK_NODE_GET(i)->b;
-
-	//Remove last node
-	if (BLOCK_NODE_GET(BLOCK_NODE_GET(t->last)->parent)->a == t->last)
-		BLOCK_NODE_GET(BLOCK_NODE_GET(t->last)->parent)->a = NULL;
-	else
-		BLOCK_NODE_GET(BLOCK_NODE_GET(t->last)->parent)->b = NULL;
-
-	if (b == t->last)
-		t->last = i;
-	else
-	{
-		//Swap with i and delete
-		struct block * n = t->last;
-		tree_swap(BLOCK_NODE_GET(b), BLOCK_NODE_GET(n));
-
-		if (b != i)
-			t->last = i;
-
-		//Fix heap
-		while (BLOCK_NODE_GET(n)->parent != NULL && tree_compare(BLOCK_NODE_GET(n)->parent, n))
-			tree_swap(BLOCK_NODE_GET(n), BLOCK_NODE_GET(BLOCK_NODE_GET(n)->parent)); //Move up
-
-		//Move
-		if (BLOCK_NODE_GET(n)->parent != NULL && tree_compare(n, BLOCK_NODE_GET(n)->parent))
-		{
-			do
-			{
-				tree_swap(BLOCK_NODE_GET(n), BLOCK_NODE_GET(BLOCK_NODE_GET(n)->parent));
-			} while (BLOCK_NODE_GET(n)->parent != NULL && tree_compare(n, BLOCK_NODE_GET(n)->parent));
-		}
-		else
-		{
-			while (BLOCK_NODE_GET(n)->a != NULL && BLOCK_NODE_GET(n)->b != NULL)
-			{
-				if (BLOCK_NODE_GET(n)->b != NULL && tree_compare(BLOCK_NODE_GET(n)->a, BLOCK_NODE_GET(n)->b))
-					if (tree_compare(n, BLOCK_NODE_GET(n)->a)) //Left swap
-						tree_swap(BLOCK_NODE_GET(n), BLOCK_NODE_GET(BLOCK_NODE_GET(n)->a));
-					else
-						break;
-				else if (tree_compare(n, BLOCK_NODE_GET(n)->b)) //Right swap
-					tree_swap(BLOCK_NODE_GET(n), BLOCK_NODE_GET(BLOCK_NODE_GET(n)->b));
-				else
-					break;
-			}
-		}
-		/*while (BLOCK_NODE_GET(n)->a != NULL && BLOCK_NODE_GET(n)->b != NULL)
-		{
-			if (tree_compare(n, BLOCK_NODE_GET(n)->a))
-			{
-				tree_swap(BLOCK_NODE_GET(n), BLOCK_NODE_GET(BLOCK_NODE_GET(n)->a));
-				n = BLOCK_NODE_GET(n)->a;
-				continue;
-			}
-
-			if (tree_compare(n, BLOCK_NODE_GET(n)->b))
-			{
-				tree_swap(BLOCK_NODE_GET(n), BLOCK_NODE_GET(BLOCK_NODE_GET(n)->b));
-				n = BLOCK_NODE_GET(n)->b;
-				continue;
-			}
-
-			break;
-		}*/
-	}
-
-	t->size--;
+	b->pool_prev = NULL;
+	b->pool_next = p->start;
+	p->start->pool_prev = b;
+	p->start = b;
+	p->size++;
+	//pool_sort(b, p); //Sort
+	lock_signal(&p->l); //Unlock
 	return 0;
 }
 
 /*
- * @function tree_search_recursive
- * Used by tree_search function to find node of size.
+ * @function pool_remove
+ * Removes node from pool
  *
- * @param size_t s, struct block * i
- * return struct block * b
+ * @param struct block_free * b, struct pool * p
+ * return int 0 success
  */
-struct block * tree_search_recursive(size_t s, struct block * i)
+int pool_remove(struct block_free * b, struct pool * p)
 {
-	if (i != NULL && i->size < s)
-	{
-		struct block * n = NULL;
-		if ((n = tree_search_recursive(s, BLOCK_NODE_GET(i)->a)) != NULL)
-				return n;
+	if (b == NULL || p == NULL)
+		return -1;
 
-		if ((n = tree_search_recursive(s, BLOCK_NODE_GET(i)->b)) != NULL)
-				return n;
-	}
+	if (b == p->start)
+		p->start = b->pool_next;
 
-	return i;
+	if (b == p->end)
+		p->end = b->pool_prev;
+
+	if (b->pool_prev != NULL)
+		b->pool_prev->pool_next = b->pool_next;
+
+	if (b->pool_next != NULL)
+		b->pool_next->pool_prev = b->pool_prev;
+
+	b->pool_prev = NULL;
+	b->pool_next = NULL;
+
+	p->size--;
+	return 0;
 }
 
-//TODO: add search node function
 /*
- * @function tree_search
- * Finds node with a size >= to specified size.
+ * @function pool_search
+ * Finds free block >= size
  *
- * @param size_t s, struct tree * t
- * @return struct block * b
+ * @param size_t s, struct pool * p
+ * @return struct block_free *
  */
-struct block * tree_search(size_t s, struct tree * t)
+struct block_free * pool_search(size_t s, struct pool * p)
 {
-	return tree_search_recursive(s, t->root);
+	if (s == 0 || p == NULL)
+		return NULL;
+
+	struct block_free * n = p->start;
+	while (n != NULL)
+		if (n->size >= s)
+			return n;
+		else
+			n = n->pool_next;
+
+	return NULL;
 }
 
 #ifdef DEBUG
 int main()
 {
+	memset(table, 0, sizeof(table));
 
-	struct tree * t = &table[0];
+	struct block_free a;
+	a.size = 100;
+	pool_insert(&a, &table[0]);
 
-	char b1_a[255];
-	struct block * b1 = (struct block *)b1_a;
-	b1->size = 100;
-	tree_insert(b1, &table[0]);
-	printf("t: %p\nSize: %zu\nRoot: %p\nLast: %p\n\n", t, t->size, t->root, t->last);
+	struct block_free b;
+	b.size = 200;
+	pool_insert(&b, &table[0]);
 
-	char b2_a[255];
-	struct block * b2 = (struct block *)b2_a;
-	b2->size = 100;
-	tree_insert(b2, &table[0]);
-	printf("t: %p\nSize: %zu\nRoot: %p\nLast: %p\n\n", t, t->size, t->root, t->last);
+	struct block_free c;
+	c.size = 300;
+	pool_insert(&c, &table[0]);
 
-	char b3_a[255];
-	struct block * b3 = (struct block *)b3_a;
-	b3->size = 200;
-	tree_insert(b3, &table[0]);
-	printf("t: %p\nSize: %zu\nRoot: %p\nLast: %p\n\n", t, t->size, t->root, t->last);
-
-
-	//tree_remove(b3, &table[0]);
-	printf("Found: %p\n\n", tree_search(300, &table[0]));
-	printf("t: %p\nSize: %zu\nRoot: %p\nLast: %p\n\n", t, t->size, t->root, t->last);
-	return 0;
+	struct pool * p = &table[0];
+	printf("%p\n", pool_search(200, &table[0]));
+	printf("%zu\n", p->size);
 }
 #endif
