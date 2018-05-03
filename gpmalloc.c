@@ -302,12 +302,21 @@ void pool_swap(struct block_free * a, struct block_free * b)
 	if (a == NULL || b == NULL)
 		return;
 
-	struct block_free * temp_p = a->pool_prev;
-	struct block_free * temp_n = a->pool_next;
-	a->pool_prev = b->pool_prev;
-	a->pool_next = b->pool_next;
-	b->pool_prev = temp_p;
-	b->pool_next = temp_n;
+	//Switch prev pointers
+	if (a->pool_prev != NULL)
+		a->pool_prev->pool_next = b;
+
+	struct block_free * temp = a->pool_prev;
+	a->pool_prev = b;
+	b->pool_prev = temp;
+
+	//Switch next pointers
+	if (b->pool_next != NULL)
+		b->pool_next->pool_prev = a;
+
+	temp = b->pool_next;
+	b->pool_next = a;
+	a->pool_next = temp;
 }
 
 /*
@@ -318,9 +327,17 @@ void pool_swap(struct block_free * a, struct block_free * b)
  */
 void pool_sort(struct block_free * b, struct pool * p)
 {
-	//TODO: fix pool_sort function
-	while (b->pool_next != p->end && b->pool_next->size < b->size)
+	while (b->pool_next != NULL)
 	{
+		if (b->size <= b->pool_next->size)
+			break;
+
+		if (b == p->start)
+			p->start = b->pool_next;
+
+		if (b->pool_next == p->end)
+			p->end = b;
+
 		pool_swap(b, b->pool_next);
 	}
 }
@@ -356,7 +373,7 @@ int pool_insert(struct block_free * b, struct pool * p)
 	p->start->pool_prev = b;
 	p->start = b;
 	p->size++;
-	//pool_sort(b, p); //Sort
+	pool_sort(b, p); //Sort
 	lock_signal(&p->l); //Unlock
 	return 0;
 }
@@ -424,15 +441,15 @@ int main()
 	pool_insert(&a, &table[0]);
 
 	struct block_free b;
-	b.size = 200;
+	b.size = 300;
 	pool_insert(&b, &table[0]);
 
 	struct block_free c;
-	c.size = 300;
+	c.size = 200;
 	pool_insert(&c, &table[0]);
 
 	struct pool * p = &table[0];
-	printf("%p\n", pool_search(200, &table[0]));
-	printf("%zu\n", p->size);
+	struct block_free * n = pool_search(200, &table[0]);
+	printf("%p\n%zu\n", n, n->size);
 }
 #endif
