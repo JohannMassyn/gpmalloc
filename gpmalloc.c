@@ -20,6 +20,7 @@
 
 //Defult Pagesize
 #define PAGESIZE_DEFAULT 4096
+#define PAGE_MIN_ALLOC 4
 
 /* -------------------- Headers -------------------- */
 
@@ -431,25 +432,76 @@ struct block_free * pool_search(size_t s, struct pool * p)
 	return NULL;
 }
 
+/*
+ * @function block_create
+ * Creates block >= size. Memory can be retrieved from mmap or sbrk call.
+ *
+ * @param size_t size
+ * @return struct block_free *
+ */
+struct block_free * block_create(size_t size)
+{
+	//Min allocation size
+	if (size < PAGE_MIN_ALLOC)
+		size += PAGE_MIN_ALLOC * page_size_get();
+
+	struct block_free * b = page_get(size + sizeof(struct block_free));
+	//TODO: sbrk support
+
+	//Check alloc worked
+	if (b == NULL)
+		return NULL;
+
+	b->block_prev = NULL;
+	b->block_next = NULL;
+	b->size = size;
+	return b;
+}
+
+/*
+ * @function block_remove
+ * Removes block and returns it to the system.
+ *
+ * @param struct block_free * b
+ * @return int 0 success, 1 if block is not full width allocation, -1 on fail
+ */
+int block_remove(struct block_free * b)
+{
+	if (b->block_prev != NULL || b->block_next != NULL)
+		return 1;
+
+	return page_free((void *)b, b->size + sizeof(struct block_free));
+}
+
+/*
+ * mem_alloc
+ * Get block of memory >= size. (internal malloc)
+ *
+ * @param size_t size
+ * @return void * address
+ */
+void * mem_alloc(size_t size)
+{
+	if (size == 0)
+		return NULL;
+
+	//Get index of pool that could contain free block
+	unsigned int index = table_index_get(size);
+
+	//Create new block
+	struct block_free * b = block_create(size);
+	if (b == NULL)
+		return NULL;
+
+	return (void *)(b + sizeof(struct block_free));
+}
+
 #ifdef DEBUG
 int main()
 {
 	memset(table, 0, sizeof(table));
 
-	struct block_free a;
-	a.size = 100;
-	pool_insert(&a, &table[0]);
-
-	struct block_free b;
-	b.size = 300;
-	pool_insert(&b, &table[0]);
-
-	struct block_free c;
-	c.size = 200;
-	pool_insert(&c, &table[0]);
-
-	struct pool * p = &table[0];
-	struct block_free * n = pool_search(200, &table[0]);
-	printf("%p\n%zu\n", n, n->size);
+	for (int i = 0; i < 20000; ++i)
+		printf("%p\n", mem_alloc(100));
 }
 #endif
