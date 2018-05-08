@@ -44,6 +44,7 @@
 	//pthread
 	#if defined(USE_LOCK) && !defined(USE_LOCK_SPIN)
 		#include<pthread.h>
+		#include <stdlib.h>
 	#endif //pthread
 #endif //__linux
 
@@ -93,7 +94,7 @@ struct pool
 
 	#ifndef USE_LOCK_GLOBAL
 		lock_t l;
-	#endif;
+	#endif
 } __attribute__((packed));
 
 /* ----------------- vars & macros ---------------- */
@@ -217,7 +218,10 @@ unsigned int table_index_get(size_t size)
 	if (size > TABLE_SIZE)
 		return (unsigned int)TABLE_SIZE;
 
-	return (unsigned int)size;
+	if (size == 0)
+		return 0;
+
+	return (unsigned int)size - 1;
 }
 
 /*
@@ -260,7 +264,6 @@ void * page_get(size_t size)
 			int fd = open("/dev/zero", O_RDWR);
 			void * addr =  mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE, -1, 0);
 		#endif
-
 		if(addr == MAP_FAILED)
 			return PAGE_FAIL;
 		else
@@ -370,6 +373,7 @@ int pool_insert(struct block_free * b, struct pool * p)
 	}
 
 	b->pool_prev = NULL;
+	printf("(%p) ", p->start);
 	b->pool_next = p->start;
 	p->start->pool_prev = b;
 	p->start = b;
@@ -442,7 +446,7 @@ struct block_free * pool_search(size_t s, struct pool * p)
 struct block_free * block_create(size_t size)
 {
 	//Min allocation size
-	if (size < PAGE_MIN_ALLOC)
+	if (size < PAGE_MIN_ALLOC * page_size_get())
 		size += PAGE_MIN_ALLOC * page_size_get();
 
 	struct block_free * b = page_get(size + sizeof(struct block_free));
@@ -454,6 +458,8 @@ struct block_free * block_create(size_t size)
 
 	b->block_prev = NULL;
 	b->block_next = NULL;
+	b->pool_prev = NULL;
+	b->pool_next = NULL;
 	b->size = size;
 	return b;
 }
@@ -467,10 +473,41 @@ struct block_free * block_create(size_t size)
  */
 int block_remove(struct block_free * b)
 {
-	if (b->block_prev != NULL || b->block_next != NULL)
+	if (b->block_prev != NULL && b->block_next != NULL)
 		return 1;
 
 	return page_free((void *)b, b->size + sizeof(struct block_free));
+}
+
+/*
+ * @function block_split
+ * Splits free block into a block = to size and a free block. Free block is added to a pool.
+ *
+ * @param size_t size, struct block_free * b (block not in pool)
+ * @return struct block *
+ */
+struct block * block_split(size_t size, struct block_free * b)
+{
+	if (size == 0 || b == NULL)
+		return NULL;
+
+	//Check if size if < b->size and that a free block will fit
+	if (size >= b->size || size + sizeof(struct block_free) + 1 > b->size)
+		return NULL;
+
+	struct block * n = (struct block *)b;
+
+	b = (struct block_free *)((size_t)b + sizeof(struct block) + size);
+	b->size = n->size - (size + sizeof(struct block_free));
+	b->block_next = NULL;
+	b->block_prev = n;
+	b->block_next = n->block_next;
+	if (pool_insert(b, &table[table_index_get(b->size)]) == -1)
+		return NULL;
+
+	n->block_next = (struct block *)b;
+	n->size = size;
+	return n;
 }
 
 /*
@@ -487,21 +524,45 @@ void * mem_alloc(size_t size)
 
 	//Get index of pool that could contain free block
 	unsigned int index = table_index_get(size);
+	struct block_free * b = pool_search(size, &table[index]);
 
-	//Create new block
-	struct block_free * b = block_create(size);
+	//Find block
+	for (; b == NULL && index <= TABLE_SIZE; ++index)
+			b = pool_search(size, &table[index]);
+
+	//If no block was found the create new one.
 	if (b == NULL)
-		return NULL;
+	{
+		b = block_create(size);
 
-	return (void *)(b + sizeof(struct block_free));
+		//If block is perfect size return it.
+		if (size + sizeof(struct block_free) + 1 > b->size)
+			return (void *)(b + sizeof(struct block));
+	}
+	else //Found block so remove it.
+		if (pool_remove(b, &table[table_index_get(b->size)]) == -1)
+			return NULL;
+
+	//If block is perfect size return it.
+	if (size + sizeof(struct block_free) + 1 > b->size)
+		return (void *)(b + sizeof(struct block));
+
+	//Split block and return.
+	struct block * n = block_split(size, b);
+	return (n == NULL)? NULL : (void *)(n + sizeof(struct block));
 }
 
 #ifdef DEBUG
 int main()
 {
 	memset(table, 0, sizeof(table));
+	struct pool * p = &table[0];
 
-	for (int i = 0; i < 20000; ++i)
-		printf("%p\n", mem_alloc(100));
+	for (int i = 0; i < 1000000; ++i)
+	{
+		struct block * b = mem_alloc(8);
+
+		printf("%d | %p\n", i, b);
+	}
 }
 #endif
