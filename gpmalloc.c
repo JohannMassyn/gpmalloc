@@ -373,7 +373,6 @@ int pool_insert(struct block_free * b, struct pool * p)
 	}
 
 	b->pool_prev = NULL;
-	printf("(%p) ", p->start);
 	b->pool_next = p->start;
 	p->start->pool_prev = b;
 	p->start = b;
@@ -511,7 +510,7 @@ struct block * block_split(size_t size, struct block_free * b)
 }
 
 /*
- * mem_alloc
+ * @function mem_alloc
  * Get block of memory >= size. (internal malloc)
  *
  * @param size_t size
@@ -537,7 +536,7 @@ void * mem_alloc(size_t size)
 
 		//If block is perfect size return it.
 		if (size + sizeof(struct block_free) + 1 > b->size)
-			return (void *)(b + sizeof(struct block));
+			return (void *)b + sizeof(struct block);
 	}
 	else //Found block so remove it.
 		if (pool_remove(b, &table[table_index_get(b->size)]) == -1)
@@ -545,11 +544,35 @@ void * mem_alloc(size_t size)
 
 	//If block is perfect size return it.
 	if (size + sizeof(struct block_free) + 1 > b->size)
-		return (void *)(b + sizeof(struct block));
+		return (void *)b + sizeof(struct block);
 
 	//Split block and return.
 	struct block * n = block_split(size, b);
-	return (n == NULL)? NULL : (void *)(n + sizeof(struct block));
+	return (n == NULL)? NULL : (void *)n + sizeof(struct block);
+}
+
+/*
+ * @function mem_free
+ * Frees allocated memory
+ *
+ * @param void * address
+ */
+void mem_free(void * address)
+{
+	if (address == NULL)
+		return;
+
+	struct block_free * b = (struct block_free *)(address - sizeof(struct block));
+
+	//Check it is the hole block
+	if (b->block_prev == NULL && b->block_next == NULL)
+	{
+		block_remove(b);
+		return;
+	}
+
+	//TODO: join if can
+	pool_insert(b, &table[table_index_get(b->size)]);
 }
 
 #ifdef DEBUG
@@ -560,8 +583,8 @@ int main()
 
 	for (int i = 0; i < 1000000; ++i)
 	{
-		struct block * b = mem_alloc(8);
-
+		void * b = mem_alloc(8);
+		mem_free(b);
 		printf("%d | %p\n", i, b);
 	}
 }
