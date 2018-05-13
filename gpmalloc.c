@@ -22,6 +22,8 @@
 #define PAGESIZE_DEFAULT 4096
 #define PAGE_MIN_ALLOC 1
 
+#define USE_SBRK
+
 /* -------------------- Headers -------------------- */
 
 #ifdef USE_HEADER
@@ -102,6 +104,9 @@ struct pool
 
 //Hash table
 struct pool table[TABLE_SIZE];
+
+//Pointer to last block (for sbrk and tracking)
+struct block_free * block_last;
 
 #define PAGE_FAIL NULL
 
@@ -258,27 +263,32 @@ size_t page_size_get(void)
  */
 void * page_get(size_t size)
 {
-	if (size < page_size_get())
-		size = page_size_get();
+	#ifdef USE_SBRK
+		void * addr = sbrk((intptr_t)size);
+		if (addr == (void *)-1)
+			return NULL;
 
-	//TODO: add sbrk support for small allocation on linux
-	#ifdef __linux
-		//To add performance on embedded devices use MAP_UNINITIALIZED flag and set bytes to
-
-		#ifdef MAP_ANONYMOUS
-			void * addr =  mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		#else //For systems with no MAP_ANONYMOUS eg BSD
-			int fd = open("/dev/zero", O_RDWR);
-			void * addr =  mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE, -1, 0);
-		#endif
-		if(addr == MAP_FAILED)
-			return PAGE_FAIL;
-		else
-			return addr;
-	#elif _WIN32
-		//TODO: add windows memory support
+		return addr;
 	#else
-		//TODO: add support for sbrk or custom heap calls
+		if (size < page_size_get())
+			size = page_size_get();
+
+		#ifdef __linux
+			//To add performance on embedded devices use MAP_UNINITIALIZED flag and set bytes to
+
+			#ifdef MAP_ANONYMOUS
+				void * addr =  mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			#else //For systems with no MAP_ANONYMOUS eg BSD
+				int fd = open("/dev/zero", O_RDWR);
+				void * addr =  mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE, -1, 0);
+			#endif
+			if(addr == MAP_FAILED)
+				return PAGE_FAIL;
+			else
+				return addr;
+		#elif _WIN32
+			//TODO: add windows memory support
+		#endif
 	#endif
 
 	return PAGE_FAIL; //Cannot find a function
@@ -293,12 +303,18 @@ void * page_get(size_t size)
  */
 int page_free(void * addr, size_t size)
 {
-	#ifdef __linux
-		return munmap(addr, size);
-	#elif _WIN32
-		//TODO: add windows support for free page
+	#ifdef USE_SBRK
+		void * r = sbrk(-(intptr_t)size);
+		if (r == (void *)-1)
+			return -1;
+
+		return 0;
 	#else
-		//TODO: add support for sbrk or custom heap calls
+		#ifdef __linux
+			return munmap(addr, size);
+		#elif _WIN32
+			//TODO: add windows support for free page
+		#endif
 	#endif
 }
 
@@ -451,18 +467,45 @@ struct block_free * pool_search(size_t s, struct pool * p)
  */
 struct block_free * block_create(size_t size)
 {
-	//Min allocation size
-	if (size < PAGE_MIN_ALLOC * page_size_get())
-		size += PAGE_MIN_ALLOC * page_size_get();
+	//Min allocation size if not using sbrk
+	#ifndef USE_SBRK
+		if (size < PAGE_MIN_ALLOC * page_size_get())
+			size += PAGE_MIN_ALLOC * page_size_get();
+	#endif
 
-	struct block_free * b = page_get(size + sizeof(struct block_free));
-	//TODO: sbrk support
+	//Add header size
+	size += sizeof(struct block_free);
+	struct block_free * b = (struct block_free *)page_get(size);
 
 	//Check alloc worked
 	if (b == NULL)
 		return NULL;
 
-	b->block_prev = NULL;
+	#ifdef USE_SBRK
+		if (block_last != NULL)
+		{
+			//Check if prev is free then just explained.
+			if (SIZE_IS_USED(block_last->size) == 0)
+			{
+				SIZE_SET(block_last->size, SIZE_GET(block_last->size) + size);
+
+				//place into correct pool
+				pool_remove(block_last, &table[table_index_get(SIZE_GET(block_last->size))]);
+				pool_insert(block_last, &table[table_index_get(SIZE_GET(block_last->size))]);
+				return block_last;
+			}
+
+			block_last->block_next = (struct block *)b;
+			b->block_prev = (struct block *)block_last;
+		}
+		else
+			b->block_prev = NULL;
+
+		block_last = b;
+	#else
+		b->block_prev = NULL;
+	#endif
+
 	b->block_next = NULL;
 	b->pool_prev = NULL;
 	b->pool_next = NULL;
@@ -482,12 +525,13 @@ int block_remove(struct block_free * b)
 	if (b->block_prev != NULL && b->block_next != NULL)
 		return 1;
 
+	#ifdef USE_SBRK
+		if (b != block_last)
+			return -1;
+	#endif
+
 	return page_free((void *)b, SIZE_GET(b->size) + sizeof(struct block_free));
 }
-
-/*
- * @function heap_expaned
- */
 
 /*
  * @function block_split
@@ -571,9 +615,13 @@ void mem_init(void)
 
 	static bool complete = false;
 	if (complete == true)
+	{
+		lock_signal(&l);
 		return;
+	}
 
 	memset(table, 0, sizeof(table));
+	block_last = NULL;
 
 	//Setup pool locks
 	#ifndef USE_LOCK_GLOBAL
@@ -605,7 +653,7 @@ void * mem_alloc(size_t size)
 	struct block_free * b = pool_search(size, &table[index]);
 
 	//Find block
-	for (; b == NULL && index <= TABLE_SIZE; ++index)
+	for (; b == NULL && index < TABLE_SIZE; ++index)
 			b = pool_search(size, &table[index]);
 
 	//If no block was found the create new one.
@@ -615,7 +663,10 @@ void * mem_alloc(size_t size)
 
 		//If block is perfect size return it.
 		if (size + sizeof(struct block_free) + 1 > SIZE_GET(b->size))
+		{
+			SIZE_STATE_SET(b->size, 1);
 			return (void *)b + sizeof(struct block);
+		}
 	}
 	else //Found block so remove it.
 		if (pool_remove(b, &table[table_index_get(SIZE_GET(b->size))]) == -1)
@@ -623,7 +674,10 @@ void * mem_alloc(size_t size)
 
 	//If block is perfect size return it.
 	if (size + sizeof(struct block_free) + 1 > SIZE_GET(b->size))
+	{
+		SIZE_STATE_SET(b->size, 1);
 		return (void *)b + sizeof(struct block);
+	}
 
 	//Split block and return.
 	struct block * n = block_split(size, b);
@@ -664,8 +718,9 @@ int main()
 {
 	for (int i = 0; i < 1000000; ++i)
 	{
-		void * m = mem_alloc(sizeof(void *));
-
+		char * m = mem_alloc(1);
+		*m = '#';
+		mem_free(m);
 		printf("%d | %p\n", i, m);
 	}
 }
