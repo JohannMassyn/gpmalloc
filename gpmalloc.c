@@ -20,7 +20,7 @@
 
 //Defult Pagesize
 #define PAGESIZE_DEFAULT 4096
-#define PAGE_MIN_ALLOC 4
+#define PAGE_MIN_ALLOC 1
 
 /* -------------------- Headers -------------------- */
 
@@ -35,6 +35,7 @@
 
 #include <stdbool.h>
 #include <memory.h>
+#include <stdint.h>
 
 //Linux headers
 #ifdef __linux
@@ -103,6 +104,12 @@ struct pool
 struct pool table[TABLE_SIZE];
 
 #define PAGE_FAIL NULL
+
+//Size
+#define SIZE_GET(s) (s & (SIZE_MAX / 2))
+#define SIZE_SET(s, x) (s = ((size_t)x | (s & ~(sizeof(size_t) / 2))))
+#define SIZE_IS_USED(s) ((int)((s >> ((sizeof(size_t) * 8) - 1)) & 1))
+#define SIZE_STATE_SET(s, x) (s ^= (-(size_t)x ^ s) & ((size_t)1 << ((sizeof(size_t) * 8) - 1)))
 
 /* ------------------------------------------------- */
 
@@ -259,7 +266,7 @@ void * page_get(size_t size)
 		//To add performance on embedded devices use MAP_UNINITIALIZED flag and set bytes to
 
 		#ifdef MAP_ANONYMOUS
-			void * addr =  mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+			void * addr =  mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		#else //For systems with no MAP_ANONYMOUS eg BSD
 			int fd = open("/dev/zero", O_RDWR);
 			void * addr =  mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE, -1, 0);
@@ -333,7 +340,7 @@ void pool_sort(struct block_free * b, struct pool * p)
 {
 	while (b->pool_next != NULL)
 	{
-		if (b->size <= b->pool_next->size)
+		if (SIZE_GET(b->size) <= SIZE_GET(b->pool_next->size))
 			break;
 
 		if (b == p->start)
@@ -427,7 +434,7 @@ struct block_free * pool_search(size_t s, struct pool * p)
 
 	struct block_free * n = p->start;
 	while (n != NULL)
-		if (n->size >= s)
+		if (SIZE_GET(n->size) >= s)
 			return n;
 		else
 			n = n->pool_next;
@@ -459,7 +466,7 @@ struct block_free * block_create(size_t size)
 	b->block_next = NULL;
 	b->pool_prev = NULL;
 	b->pool_next = NULL;
-	b->size = size;
+	SIZE_SET(b->size, size);
 	return b;
 }
 
@@ -475,7 +482,7 @@ int block_remove(struct block_free * b)
 	if (b->block_prev != NULL && b->block_next != NULL)
 		return 1;
 
-	return page_free((void *)b, b->size + sizeof(struct block_free));
+	return page_free((void *)b, SIZE_GET(b->size) + sizeof(struct block_free));
 }
 
 /*
@@ -491,13 +498,14 @@ struct block * block_split(size_t size, struct block_free * b)
 		return NULL;
 
 	//Check if size if < b->size and that a free block will fit
-	if (size >= b->size || size + sizeof(struct block_free) + 1 > b->size)
+	if (size >= b->size || size + sizeof(struct block_free) + 1 > SIZE_GET(b->size))
 		return NULL;
 
 	struct block * n = (struct block *)b;
 
 	b = (struct block_free *)((size_t)b + sizeof(struct block) + size);
-	b->size = n->size - (size + sizeof(struct block_free));
+	SIZE_SET(b->size, SIZE_GET(n->size) - (size + sizeof(struct block_free)));
+	SIZE_STATE_SET(b->size, 0);
 	b->block_next = NULL;
 	b->block_prev = n;
 	b->block_next = n->block_next;
@@ -505,8 +513,41 @@ struct block * block_split(size_t size, struct block_free * b)
 		return NULL;
 
 	n->block_next = (struct block *)b;
-	n->size = size;
+	SIZE_SET(n->size, size);
+	SIZE_STATE_SET(n->size, 1);
 	return n;
+}
+
+/*
+ * @function block_join
+ * Joins with right and remove right from pool,
+ * and join with left block but will not remove b from pool.
+ *
+ * @param struct block_free * b
+ * @returns int 0 success, -1 fail
+ */
+int block_join(struct block_free * b)
+{
+	if (b == NULL || SIZE_IS_USED(b->size))
+		return -1;
+
+	//Join with right
+	if (b->block_next != NULL && !SIZE_IS_USED(b->block_next->size))
+	{
+		pool_remove((struct block_free *)b->block_next, &table[table_index_get(SIZE_GET(b->block_next->size))]);
+		SIZE_SET(b->size, SIZE_GET(b->block_next->size) + sizeof(struct block_free));
+		b->block_next = b->block_next->block_next;
+	}
+
+	//Join with left
+	if (b->block_prev != NULL && !SIZE_IS_USED(b->block_prev->size))
+	{
+		pool_remove(b, &table[table_index_get(SIZE_GET(b->size))]);
+		SIZE_SET(b->block_prev->size, SIZE_GET(b->size) + sizeof(struct block_free));
+		b->block_prev->block_next = b->block_next;
+	}
+
+	return 0;
 }
 
 /*
@@ -535,15 +576,15 @@ void * mem_alloc(size_t size)
 		b = block_create(size);
 
 		//If block is perfect size return it.
-		if (size + sizeof(struct block_free) + 1 > b->size)
+		if (size + sizeof(struct block_free) + 1 > SIZE_GET(b->size))
 			return (void *)b + sizeof(struct block);
 	}
 	else //Found block so remove it.
-		if (pool_remove(b, &table[table_index_get(b->size)]) == -1)
+		if (pool_remove(b, &table[table_index_get(SIZE_GET(b->size))]) == -1)
 			return NULL;
 
 	//If block is perfect size return it.
-	if (size + sizeof(struct block_free) + 1 > b->size)
+	if (size + sizeof(struct block_free) + 1 > SIZE_GET(b->size))
 		return (void *)b + sizeof(struct block);
 
 	//Split block and return.
@@ -564,6 +605,9 @@ void mem_free(void * address)
 
 	struct block_free * b = (struct block_free *)(address - sizeof(struct block));
 
+	if (!SIZE_IS_USED(b->size))
+		return; //Error address is not a used block
+
 	//Check it is the hole block
 	if (b->block_prev == NULL && b->block_next == NULL)
 	{
@@ -571,8 +615,10 @@ void mem_free(void * address)
 		return;
 	}
 
-	//TODO: join if can
-	pool_insert(b, &table[table_index_get(b->size)]);
+	//Join block of can
+	SIZE_STATE_SET(b->size, 0);
+	pool_insert(b, &table[table_index_get(SIZE_GET(b->size))]);
+	block_join(b);
 }
 
 #ifdef DEBUG
@@ -581,9 +627,26 @@ int main()
 	memset(table, 0, sizeof(table));
 	struct pool * p = &table[0];
 
+	void * m = mem_alloc(1);
+	struct block * b = m - sizeof(struct block);
+	printf("Block size after malloc: %zu\n", SIZE_GET(b->size));
+	mem_free(m);
+	printf("Block size after free: %zu\n", SIZE_GET(b->size));
+
+	printf("%zu pages  %zu bytes\n", SIZE_GET(b->size) / page_size_get(),
+	       SIZE_GET(b->size) % page_size_get());
+	printf("MIN allocation size is %d pages (%zu)\n", PAGE_MIN_ALLOC, PAGE_MIN_ALLOC * page_size_get());
+
+	printf("size of header: %zu\n", sizeof(struct block_free));
+	printf("Extra space allocated. %zu headers + %zu bytes for program\n",
+	       (SIZE_GET(b->size) % page_size_get()) / sizeof(struct block_free),
+	       (SIZE_GET(b->size) % page_size_get()) % sizeof(struct block_free));
+
 	for (int i = 0; i < 1000000; ++i)
 	{
-		void * b = mem_alloc(8);
+		void * b = mem_alloc(1);
+
+
 		mem_free(b);
 		printf("%d | %p\n", i, b);
 	}
