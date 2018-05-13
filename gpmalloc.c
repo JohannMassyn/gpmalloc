@@ -486,6 +486,10 @@ int block_remove(struct block_free * b)
 }
 
 /*
+ * @function heap_expaned
+ */
+
+/*
  * @function block_split
  * Splits free block into a block = to size and a free block. Free block is added to a pool.
  *
@@ -551,6 +555,37 @@ int block_join(struct block_free * b)
 }
 
 /*
+ * @function mem_init
+ * Sets up memory allocator pools.
+ */
+void mem_init(void)
+{
+	//Setup mutex lock statically
+	#if defined(__linux) && !defined(USE_LOCK_SPIN)
+		static lock_t l = PTHREAD_MUTEX_INITIALIZER;
+	#else
+		static lock_t l = 0;
+	#endif
+
+	lock_wait(&l);
+
+	static bool complete = false;
+	if (complete == true)
+		return;
+
+	memset(table, 0, sizeof(table));
+
+	//Setup pool locks
+	#ifndef USE_LOCK_GLOBAL
+		for (int i = 0; i < TABLE_SIZE; ++i)
+			lock_create(&table[i].l);
+	#endif
+
+	complete = true;
+	lock_signal(&l);
+}
+
+/*
  * @function mem_alloc
  * Get block of memory >= size. (internal malloc)
  *
@@ -561,6 +596,9 @@ void * mem_alloc(size_t size)
 {
 	if (size == 0)
 		return NULL;
+
+	//Setup allocator if needed.
+	mem_init();
 
 	//Get index of pool that could contain free block
 	unsigned int index = table_index_get(size);
@@ -624,31 +662,11 @@ void mem_free(void * address)
 #ifdef DEBUG
 int main()
 {
-	memset(table, 0, sizeof(table));
-	struct pool * p = &table[0];
-
-	void * m = mem_alloc(1);
-	struct block * b = m - sizeof(struct block);
-	printf("Block size after malloc: %zu\n", SIZE_GET(b->size));
-	mem_free(m);
-	printf("Block size after free: %zu\n", SIZE_GET(b->size));
-
-	printf("%zu pages  %zu bytes\n", SIZE_GET(b->size) / page_size_get(),
-	       SIZE_GET(b->size) % page_size_get());
-	printf("MIN allocation size is %d pages (%zu)\n", PAGE_MIN_ALLOC, PAGE_MIN_ALLOC * page_size_get());
-
-	printf("size of header: %zu\n", sizeof(struct block_free));
-	printf("Extra space allocated. %zu headers + %zu bytes for program\n",
-	       (SIZE_GET(b->size) % page_size_get()) / sizeof(struct block_free),
-	       (SIZE_GET(b->size) % page_size_get()) % sizeof(struct block_free));
-
 	for (int i = 0; i < 1000000; ++i)
 	{
-		void * b = mem_alloc(1);
+		void * m = mem_alloc(sizeof(void *));
 
-
-		mem_free(b);
-		printf("%d | %p\n", i, b);
+		printf("%d | %p\n", i, m);
 	}
 }
 #endif
