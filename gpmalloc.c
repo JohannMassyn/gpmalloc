@@ -7,7 +7,8 @@
 
 /* -------------------- Options -------------------- */
 #define DEBUG
-#define USE_HEADER
+//#define USE_HEADER
+#define USE_PREFIX
 
 //Locks
 #define USE_LOCK
@@ -55,6 +56,29 @@
 //Windows 32 headers
 #ifdef _WIN32
 #endif //_WIN32
+
+//Malloc header
+#ifndef USE_HEADER
+#ifdef __cplusplus
+		extern "C" {
+			#endif
+
+			#ifndef USE_PREFIX
+				#define malloc mem_alloc
+				#define calloc mem_calloc
+				#define realloc mem_realloc
+				#define free mem_free
+			#endif /* end of not USE_PREFIX */
+
+			void * mem_alloc(size_t);
+			void * mem_calloc(size_t, size_t);
+			void * mem_realloc(void *, size_t);
+			void mem_free(void *);
+
+			#ifdef __cplusplus
+		};  /* end of extern "C" */
+	#endif
+#endif /* end of USE_HEADER */
 
 /* ------------------- Typedef & Structures ------------------ */
 
@@ -499,17 +523,18 @@ struct block * block_create(size_t size)
 	#endif
 
 	//Create new block
-	size += sizeof(struct block); //Add header size
-	struct block * b = (struct block *)page_get(size);
+	struct block * b = (struct block *)page_get(size + sizeof(struct block_free));
 
 	//Check alloc worked
 	if (b == NULL)
 		return NULL;
 
 	#ifdef USE_SBRK
+		if (block_last != NULL)
+			block_last->block_next = b;
+
 		b->block_prev = block_last;
 		block_last = b;
-		block_last->block_next = b;
 	#else
 		b->block_prev = NULL;
 	#endif
@@ -597,15 +622,23 @@ int block_join(struct block_free * b)
 	{
 		pool_remove((struct block_free *)b->block_next);
 		SIZE_SET(b->size, SIZE_GET(b->block_next->size) + sizeof(struct block_free));
+
 		b->block_next = b->block_next->block_next;
+		if (b->block_next != NULL)
+			b->block_next->block_prev = (struct block *)b;
+		pool_insert(b);
 	}
 
 	//Join with left
 	if (b->block_prev != NULL && !SIZE_IS_USED(b->block_prev->size))
 	{
-		pool_remove(b);
+		pool_remove((struct block_free *)b->block_prev);
 		SIZE_SET(b->block_prev->size, SIZE_GET(b->size) + sizeof(struct block_free));
 		b->block_prev->block_next = b->block_next;
+
+		if (b->block_next != NULL)
+			b->block_next->block_prev = b->block_prev;
+		pool_insert((struct block_free *)b->block_prev);
 	}
 
 	return 0;
@@ -714,8 +747,46 @@ void mem_free(void * address)
 	}
 
 	//Join block
+	SIZE_STATE_SET(b->size, 0);
+	b->pool_prev = NULL;
+	b->block_next = NULL;
 	block_join(b);
-	pool_insert(b);
+}
+
+/*
+ * @function mem_calloc
+ * Allocates memory array
+ *
+ * @param size_t number of nodes, size_t sizeof node
+ */
+void * mem_calloc(size_t n, size_t size)
+{
+	void * address = mem_alloc(size * size);
+	if (address == NULL)
+		return NULL;
+
+	memset(address, 0, size);
+	return address;
+}
+
+/*
+ * @function mem_realloc
+ * Reallocates memory into new block of size
+ *
+ * @param void * adrdess, size_t new size
+ */
+void * mem_realloc(void * address, size_t size)
+{
+	if (address == NULL)
+		return NULL;
+
+	void * temp = mem_alloc(size);
+	if (temp == NULL)
+		return NULL;
+
+	memcpy(temp, (const void *)address, size);
+	mem_free(address);
+	return temp;
 }
 
 #ifdef DEBUG
@@ -752,27 +823,75 @@ double time_record(void)
 
 int main()
 {
+	/*void * a = mem_alloc(32);
+	void * b = mem_alloc(32);
+	void * c = mem_alloc(32);
+	struct block * t = a - sizeof(struct block);
+	mem_free(a);
+	mem_free(b);
+
+
+
+
+	printf("%d\n", (int)SIZE_GET(t->size));
+	return 0;*/
+	FILE * fp = fopen("out.csv", "w");
+	fprintf(fp, "Index,Table index,Malloc size,Free address,Free time taken,Free memory difference,Malloc address,Malloc time taken,Malloc memory difference\n");
+
+	int numberofpointers = 10000;
+	void * table[numberofpointers];
+	memset(table, 0, sizeof(table));
+
 	srand(123456);
 	size_t start = (size_t)sbrk(0);
 	clock_t time_start = clock();
 
-	for (int i = 0; i < 1000000; ++i)
+	for (int i = 0; i < 10000; ++i)
 	{
-		if (i % 10000)
-			fflush(stdout);
-
+		printf(".\n");
 		size_t s = (size_t)(rand() % 32) + 1;
-		void * m = mem_alloc(s);
-		printf("%u | %p - %zu Bytes\n", i, m, s);
-		mem_free(m);
+		unsigned int index = (unsigned int)rand() % numberofpointers;
+		fprintf(fp, "%d,%lli,%zu,", i, (signed long long)index, s);
+
+		//////// Free //////////////////////////////////////////
+		if (table[index] != NULL)
+		{
+			long long free_mem_s = (long long)sbrk(0);
+			time_record();
+
+			mem_free(table[index]);
+
+			double free_time = time_record();
+			long long free_mem_e = (long long)sbrk(0);
+			fprintf(fp,"%p,%e,%lli", table[index], free_time, free_mem_e - free_mem_s);
+		}
+		else
+			fprintf(fp, "%p,%e,%lli,", NULL,(double)0, (long long)0);
+		////////////////////////////////////////////////////////
+
+		//////// malloc ////////////////////////////////////////
+		long long malloc_mem_s = (long long)sbrk(0);
+		time_record();
+
+		char * m = mem_alloc(s);
+
+		double malloc_time = time_record();
+		long long malloc_mem_e = (long long)sbrk(0);
+		fprintf(fp, "%p, %e,%zu\n", (void *)m, malloc_time, malloc_mem_e - malloc_mem_s);
+		////////////////////////////////////////////////////////
+
+		table[index] = (void *)m;
+		m[0] = '#';
 	}
 
 	clock_t time_end = clock();
 	size_t end = (size_t)sbrk(0);
+	fclose(fp);
 	printf("\nBRK Start: %zu\n", start);
 	printf("BRK End: %zu\n", end);
-	printf("Difference: %zu\n", end - start);
+	printf("Extra memory: %zu\n", end - start);
 	printf("Time taken: %e\n", (double)(time_end - time_start) / CLOCKS_PER_SEC);
+	printf("CLOCKS_PER_SEC: %d\n", CLOCKS_PER_SEC);
 	return 0;
 }
 #endif
