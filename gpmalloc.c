@@ -6,13 +6,11 @@
  */
 
 /* -------------------- Options -------------------- */
-
 #define DEBUG
 #define USE_HEADER
 
 //Locks
 #define USE_LOCK
-//#define USE_LOCK_GLOBAL
 //#define USE_LOCK_SPIN
 
 //Tree table
@@ -41,7 +39,10 @@
 
 //Linux headers
 #ifdef __linux
-	#include <sys/mman.h>
+	#ifndef USE_SBRK
+		#include <sys/mman.h>
+	#endif
+
 	#include <unistd.h>
 
 	//pthread
@@ -94,10 +95,6 @@ struct pool
 	struct block_free * start;
 	struct block_free * end;
 	size_t size;
-
-	#ifndef USE_LOCK_GLOBAL
-		lock_t l;
-	#endif
 } __attribute__((packed));
 
 /* ----------------- vars & macros ---------------- */
@@ -105,8 +102,16 @@ struct pool
 //Hash table
 struct pool table[TABLE_SIZE];
 
+unsigned int pool_min_index = 0;
+unsigned int pool_max_index = 0;
+
 //Pointer to last block (for sbrk and tracking)
-struct block_free * block_last;
+struct block * block_last;
+
+//Lock
+#ifndef USE_LOCK_GLOBAL
+	lock_t l;
+#endif
 
 #define PAGE_FAIL NULL
 
@@ -304,10 +309,8 @@ void * page_get(size_t size)
 int page_free(void * addr, size_t size)
 {
 	#ifdef USE_SBRK
-		void * r = sbrk(-(intptr_t)size);
-		if (r == (void *)-1)
-			return -1;
-
+		if (sbrk(-(intptr_t)(sbrk(0) - size)) == (void *)-1)
+			return 1;
 		return 0;
 	#else
 		#ifdef __linux
@@ -350,10 +353,12 @@ void pool_swap(struct block_free * a, struct block_free * b)
  * @function pool_sort
  * Sorts node in pool
  *
- * @param struct block_free * b, struct pool * p
+ * @param struct block_free * b
  */
-void pool_sort(struct block_free * b, struct pool * p)
+void pool_sort(struct block_free * b)
 {
+	struct pool * p = &table[table_index_get(SIZE_GET(b->size))];
+
 	while (b->pool_next != NULL)
 	{
 		if (SIZE_GET(b->size) <= SIZE_GET(b->pool_next->size))
@@ -373,16 +378,18 @@ void pool_sort(struct block_free * b, struct pool * p)
  * @function pool_insert
  * Adds free block into pool's linked list
  *
- * @param struct block_free * b, struct pool * p
+ * @param struct block_free * b
  * @return int 0 success
  */
-int pool_insert(struct block_free * b, struct pool * p)
+int pool_insert(struct block_free * b)
 {
-	if (b == NULL || p == NULL)
+	if (b == NULL)
 		return -1;
 
+	struct pool * p = &table[table_index_get(SIZE_GET(b->size))];
+
 	//Lock pool
-	lock_wait(&p->l);
+	lock_wait(&l);
 
 	//First node
 	if (p->start == NULL)
@@ -400,8 +407,15 @@ int pool_insert(struct block_free * b, struct pool * p)
 	p->start->pool_prev = b;
 	p->start = b;
 	p->size++;
-	pool_sort(b, p); //Sort
-	lock_signal(&p->l); //Unlock
+	pool_sort(b); //Sort
+
+	if (p->size <= table[pool_min_index].size)
+		pool_min_index = table_index_get(SIZE_GET(b->size));
+
+	if (p->size >= table[pool_max_index].size)
+		pool_max_index = table_index_get(SIZE_GET(b->size));
+
+	lock_signal(&l); //Unlock
 	return 0;
 }
 
@@ -409,14 +423,15 @@ int pool_insert(struct block_free * b, struct pool * p)
  * @function pool_remove
  * Removes node from pool
  *
- * @param struct block_free * b, struct pool * p
+ * @param struct block_free * b
  * return int 0 success
  */
-int pool_remove(struct block_free * b, struct pool * p)
+int pool_remove(struct block_free * b)
 {
-	if (b == NULL || p == NULL)
+	if (b == NULL)
 		return -1;
 
+	struct pool * p = &table[table_index_get(SIZE_GET(b->size))];
 	if (b == p->start)
 		p->start = b->pool_next;
 
@@ -433,6 +448,13 @@ int pool_remove(struct block_free * b, struct pool * p)
 	b->pool_next = NULL;
 
 	p->size--;
+
+	if (p->size <= table[pool_min_index].size)
+		pool_min_index = table_index_get(SIZE_GET(b->size));
+
+	if (p->size >= table[pool_max_index].size)
+		pool_max_index = table_index_get(SIZE_GET(b->size));
+
 	return 0;
 }
 
@@ -440,13 +462,16 @@ int pool_remove(struct block_free * b, struct pool * p)
  * @function pool_search
  * Finds free block >= size
  *
- * @param size_t s, struct pool * p
+ * @param size_t s
  * @return struct block_free *
  */
 struct block_free * pool_search(size_t s, struct pool * p)
 {
-	if (s == 0 || p == NULL)
+	if (s == 0)
 		return NULL;
+
+	if (p == NULL)
+		p = &table[table_index_get(s)];
 
 	struct block_free * n = p->start;
 	while (n != NULL)
@@ -465,7 +490,7 @@ struct block_free * pool_search(size_t s, struct pool * p)
  * @param size_t size
  * @return struct block_free *
  */
-struct block_free * block_create(size_t size)
+struct block * block_create(size_t size)
 {
 	//Min allocation size if not using sbrk
 	#ifndef USE_SBRK
@@ -473,43 +498,25 @@ struct block_free * block_create(size_t size)
 			size += PAGE_MIN_ALLOC * page_size_get();
 	#endif
 
-	//Add header size
-	size += sizeof(struct block_free);
-	struct block_free * b = (struct block_free *)page_get(size);
+	//Create new block
+	size += sizeof(struct block); //Add header size
+	struct block * b = (struct block *)page_get(size);
 
 	//Check alloc worked
 	if (b == NULL)
 		return NULL;
 
 	#ifdef USE_SBRK
-		if (block_last != NULL)
-		{
-			//Check if prev is free then just explained.
-			if (SIZE_IS_USED(block_last->size) == 0)
-			{
-				SIZE_SET(block_last->size, SIZE_GET(block_last->size) + size);
-
-				//place into correct pool
-				pool_remove(block_last, &table[table_index_get(SIZE_GET(block_last->size))]);
-				pool_insert(block_last, &table[table_index_get(SIZE_GET(block_last->size))]);
-				return block_last;
-			}
-
-			block_last->block_next = (struct block *)b;
-			b->block_prev = (struct block *)block_last;
-		}
-		else
-			b->block_prev = NULL;
-
+		b->block_prev = block_last;
 		block_last = b;
+		block_last->block_next = b;
 	#else
 		b->block_prev = NULL;
 	#endif
 
 	b->block_next = NULL;
-	b->pool_prev = NULL;
-	b->pool_next = NULL;
 	SIZE_SET(b->size, size);
+	SIZE_STATE_SET(b->size, 1);
 	return b;
 }
 
@@ -518,16 +525,22 @@ struct block_free * block_create(size_t size)
  * Removes block and returns it to the system.
  *
  * @param struct block_free * b
- * @return int 0 success, 1 if block is not full width allocation, -1 on fail
+ * @return int 0 success, 1 if block is not full width allocation, -1 on fail, 2 on fail try
  */
 int block_remove(struct block_free * b)
 {
-	if (b->block_prev != NULL && b->block_next != NULL)
-		return 1;
-
 	#ifdef USE_SBRK
-		if (b != block_last)
+		if ((struct block *)b != block_last)
 			return -1;
+
+		block_last = b->block_prev;
+
+		if (block_last != NULL)
+			block_last->block_next = NULL;
+
+	#else
+		if (b->block_prev != NULL && b->block_next != NULL)
+			return 2;
 	#endif
 
 	return page_free((void *)b, SIZE_GET(b->size) + sizeof(struct block_free));
@@ -557,7 +570,7 @@ struct block * block_split(size_t size, struct block_free * b)
 	b->block_next = NULL;
 	b->block_prev = n;
 	b->block_next = n->block_next;
-	if (pool_insert(b, &table[table_index_get(b->size)]) == -1)
+	if (pool_insert(b) == -1)
 		return NULL;
 
 	n->block_next = (struct block *)b;
@@ -582,7 +595,7 @@ int block_join(struct block_free * b)
 	//Join with right
 	if (b->block_next != NULL && !SIZE_IS_USED(b->block_next->size))
 	{
-		pool_remove((struct block_free *)b->block_next, &table[table_index_get(SIZE_GET(b->block_next->size))]);
+		pool_remove((struct block_free *)b->block_next);
 		SIZE_SET(b->size, SIZE_GET(b->block_next->size) + sizeof(struct block_free));
 		b->block_next = b->block_next->block_next;
 	}
@@ -590,7 +603,7 @@ int block_join(struct block_free * b)
 	//Join with left
 	if (b->block_prev != NULL && !SIZE_IS_USED(b->block_prev->size))
 	{
-		pool_remove(b, &table[table_index_get(SIZE_GET(b->size))]);
+		pool_remove(b);
 		SIZE_SET(b->block_prev->size, SIZE_GET(b->size) + sizeof(struct block_free));
 		b->block_prev->block_next = b->block_next;
 	}
@@ -612,7 +625,7 @@ void mem_init(void)
 	#endif
 
 	lock_wait(&l);
-
+	
 	static bool complete = false;
 	if (complete == true)
 	{
@@ -620,14 +633,11 @@ void mem_init(void)
 		return;
 	}
 
+	pool_min_index = 0;
+	pool_max_index = 0;
+
 	memset(table, 0, sizeof(table));
 	block_last = NULL;
-
-	//Setup pool locks
-	#ifndef USE_LOCK_GLOBAL
-		for (int i = 0; i < TABLE_SIZE; ++i)
-			lock_create(&table[i].l);
-	#endif
 
 	complete = true;
 	lock_signal(&l);
@@ -650,27 +660,17 @@ void * mem_alloc(size_t size)
 
 	//Get index of pool that could contain free block
 	unsigned int index = table_index_get(size);
-	struct block_free * b = pool_search(size, &table[index]);
+	struct block_free * b = pool_search(size, NULL);
 
-	//Find block
-	for (; b == NULL && index < TABLE_SIZE; ++index)
-			b = pool_search(size, &table[index]);
+	if (b == NULL)
+		b = pool_search(size, &table[pool_max_index]);
 
 	//If no block was found the create new one.
 	if (b == NULL)
 	{
-		b = block_create(size);
-
-		//If block is perfect size return it.
-		if (size + sizeof(struct block_free) + 1 > SIZE_GET(b->size))
-		{
-			SIZE_STATE_SET(b->size, 1);
-			return (void *)b + sizeof(struct block);
-		}
+		struct block * n = block_create(size);
+		return (n == NULL)? NULL : (void *)n + sizeof(struct block);
 	}
-	else //Found block so remove it.
-		if (pool_remove(b, &table[table_index_get(SIZE_GET(b->size))]) == -1)
-			return NULL;
 
 	//If block is perfect size return it.
 	if (size + sizeof(struct block_free) + 1 > SIZE_GET(b->size))
@@ -697,31 +697,82 @@ void mem_free(void * address)
 
 	struct block_free * b = (struct block_free *)(address - sizeof(struct block));
 
-	if (!SIZE_IS_USED(b->size))
+	if (SIZE_IS_USED(b->size) == 0)
 		return; //Error address is not a used block
 
-	//Check it is the hole block
-	if (b->block_prev == NULL && b->block_next == NULL)
+	//Try to remove block if using mmap
+	#ifndef USE_SBRK
+		if (block_remove(b))
+			return;
+	#endif
+
+	SIZE_STATE_SET(b->size, 0);
+	if ((struct block *)b == block_last)
 	{
 		block_remove(b);
 		return;
 	}
 
-	//Join block of can
-	SIZE_STATE_SET(b->size, 0);
-	pool_insert(b, &table[table_index_get(SIZE_GET(b->size))]);
+	//Join block
 	block_join(b);
+	pool_insert(b);
 }
 
 #ifdef DEBUG
+
+/*
+ * Converts timespec to double
+ *
+ * @param struct timespec time
+ * @return double time
+ */
+double time_to_double(struct timespec time)
+{
+	//1000000000.0 = conversion rate 1000 X 1000 X 1000 (sec->millsec->usec->nsec)
+	return ((double) time.tv_sec + (time.tv_nsec / 1000000000.0));
+}
+
+/*
+ * time_record
+ *
+ * @return double difference.
+ */
+double time_record(void)
+{
+	static struct timespec a;
+	struct timespec b;
+
+	if (timespec_get(&b, TIME_UTC) == 0) {
+		printf("ERROR: Could not record resource usage.\n");
+		exit(EXIT_FAILURE);
+	}
+
+	return time_to_double(b) - time_to_double(a);
+}
+
 int main()
 {
+	srand(123456);
+	size_t start = (size_t)sbrk(0);
+	clock_t time_start = clock();
+
 	for (int i = 0; i < 1000000; ++i)
 	{
-		char * m = mem_alloc(1);
-		*m = '#';
+		if (i % 10000)
+			fflush(stdout);
+
+		size_t s = (size_t)(rand() % 32) + 1;
+		void * m = mem_alloc(s);
+		printf("%u | %p - %zu Bytes\n", i, m, s);
 		mem_free(m);
-		printf("%d | %p\n", i, m);
 	}
+
+	clock_t time_end = clock();
+	size_t end = (size_t)sbrk(0);
+	printf("\nBRK Start: %zu\n", start);
+	printf("BRK End: %zu\n", end);
+	printf("Difference: %zu\n", end - start);
+	printf("Time taken: %e\n", (double)(time_end - time_start) / CLOCKS_PER_SEC);
+	return 0;
 }
 #endif
